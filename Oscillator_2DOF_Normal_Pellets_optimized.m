@@ -1,0 +1,244 @@
+close all; clear; clc; tic;  
+run('parameters.m');
+
+% Create a struct with the simulation parameters
+simulation_params = struct('Mc', Mc, 'Mp1', Mp1, ...
+    'C', C, 'K', K, 'Mu_kc', Mu_kc, 'Mu_kp', Mu_kp, 'g', g, ...
+    'OMEGA', OMEGA, 'F0', F0, 'e', e, 'Xc0', Xc0, 'Xp10', Xp10, ...
+    'Vc0', Vc0, 'Vp10', Vp10, ...
+    'ks', ks, 'x', x, 'Fk', Fk, ...
+    'H1', H1, 'N', N, ...
+    'T_span_all', T_span_all, 'T_step', T_step, 'time_tolerance', time_tolerance, ...
+    'Height', Height, 'Width', Width, 'th', th, 'scale_factor', scale_factor, ...
+    'k_line', k_line, 'c_line', c_line);
+
+% Create the .txt file with simulation information
+results_folder = 'results'; 
+if ~exist(results_folder, 'dir')
+    mkdir(results_folder);
+end
+filename = fullfile(results_folder, 'impact_details.txt');
+fileID = create_simulation_info(filename, simulation_params);
+
+% Initial conditions 
+initial_conditions = [Xc0, Vc0, Xp10, Vp10];
+T_span = T_span_all(1):T_step:T_span_all(2);
+
+% Plot and simulation control flags
+plot_enabled = true;
+verbose = false;
+
+% Preallocation (kept)
+T_all_cell = cell(N+1,1);
+Y_all_cell = cell(N+1,1);
+V_all_cell = cell(N+1,1);
+impact_details = {};
+T_impact = zeros(N,1);
+delta_xp_all = cell(N,1);
+
+color_set = repmat({[0.3, 0.3 , 0.3], [0.2, 0.8, 0.6], [0.3010, 0.7450, 0.9330], [0, 0.4470, 0.7410], [0.4940, 0.1840, 0.5560], [0.4, 0, 0.4]}, N, 1);
+
+% Pre-plot setup
+if plot_enabled
+    figure_displacements = figure; hold on; grid on; xlabel('Time (s)'); ylabel('Displacement (m)'); title('Displacement of masses over time');
+    figure_displacements_clean = figure; hold on; grid on; xlabel('Time (s)'); ylabel('Displacement (m)'); title('Displacement (no lines of contact)');
+    figure_velocities = figure; hold on; grid on; xlabel('Time (s)'); ylabel('Velocity (m/s)'); title('Velocity of masses');
+    figure_delta_xp = figure; hold on; grid on; xlabel('Time (s)'); ylabel('\Delta x_{p} (m)'); title('Relative displacement of the Pellets');
+end
+
+T_impact_last = 0;
+last_contact_time_p1 = -inf;
+
+%% ----------------- ODE handle (Hertzian contact) -----------------
+ode = @(T,Y) hertz_ode(T,Y);
+
+i = 1;
+while i <= N
+    [T, Y] = ode45(ode, T_span, initial_conditions); 
+    V = Y(:, 2:2:end);
+
+    delta_xp1 = -(Y(:, 1) - Y(:, 3));  
+
+    s = (abs(delta_xp1) - H1) > 0;
+    indices_p1 = find(diff(s)==1) + 1;
+    valid_indices_p1 = indices_p1(T(indices_p1) > last_contact_time_p1 + time_tolerance);
+
+    if isempty(valid_indices_p1)
+        T_all_cell{i} = T;
+        Y_all_cell{i} = Y;
+        V_all_cell{i} = V;
+        break;
+    end
+
+    % Log the first contact start
+    impact_index = valid_indices_p1(1);
+    T_impact(i) = T(impact_index);
+    last_contact_time_p1 = T(impact_index);
+
+    Xc_imp = Y(impact_index, 1);
+    Xp_imp = Y(impact_index, 3);
+    Vc_imp = Y(impact_index, 2);
+    Vp_imp = Y(impact_index, 4);
+
+    % Compute overlap & Hertz force at the event for logging
+    dx_imp = Xp_imp - Xc_imp;
+    delta_imp = abs(dx_imp) - H1;
+    sgn_imp = sign(dx_imp);
+    ddelta_imp = sgn_imp*(Vp_imp - Vc_imp);
+    if delta_imp > 0
+        Fn_imp = k_line*delta_imp;
+        if ddelta_imp > 0
+            Fn_imp = Fn_imp + c_line*ddelta_imp;
+        end
+    else
+        Fn_imp = 0;
+    end
+
+    initial_conditions = [Xc_imp, Vc_imp, Xp_imp, Vp_imp];
+
+    contact_side = 'Right wall';
+    if dx_imp < 0
+        contact_side = 'Left wall';
+    end
+
+    impact_details{end + 1} = sprintf(['Contact start Mp1\nTime %d: %.5f s\n' ...
+                                        'Overlap \\delta: %.6e m\n' ...
+                                        'Fn (Hertz-KK): %.6e N'], ...
+                                        i, T_impact(i), max(delta_imp,0), Fn_imp);
+    fprintf(fileID, '%d\t%.6f\t%d\t%.6f\t%s\t%.6e\n', i, T_impact(i), 1, max(delta_imp,0), contact_side, Fn_imp);
+
+    % Store partial trajectories up to the contact start
+    T_all_cell{i} = T(1:impact_index);
+    Y_all_cell{i} = Y(1:impact_index, :);
+    V_all_cell{i} = V(1:impact_index, :);
+    delta_xp_all{i} = delta_xp1(1:impact_index);
+
+    % Plotting 
+    if plot_enabled
+        figure(figure_displacements); 
+        plot(T(1:impact_index), Y(1:impact_index,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T(1:impact_index), Y(1:impact_index,3), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+        yl = ylim;
+        plot([T_impact(i), T_impact(i)], yl, '--', 'Color', [0.6, 0.6, 0.6, 0.7], 'LineWidth', 0.5);
+        plot([T_impact_last, T_impact_last], yl, '--', 'Color', [0.6, 0.6, 0.6, 0.7], 'LineWidth', 0.5);
+
+        figure(figure_displacements_clean); 
+        plot(T(1:impact_index), Y(1:impact_index,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T(1:impact_index), Y(1:impact_index,3), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+
+        figure(figure_velocities); 
+        plot(T(1:impact_index), V(1:impact_index,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T(1:impact_index), V(1:impact_index,2), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+
+        figure(figure_delta_xp); 
+        plot(T(1:impact_index), -delta_xp1(1:impact_index), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+    end
+
+    T_impact_last = T_impact(i);
+    T_span = T_impact(i):T_step:T_span_all(2);
+    i = i + 1;
+end
+
+% Simulate final segment if needed 
+if T_impact(max(i-1,1)) < T_span_all(2)
+    [T, Y] = ode45(ode, T_impact(max(i-1,1)):T_step:T_span_all(2), initial_conditions);
+    V = Y(:, 2:2:end);
+
+    T_all_cell{i} = T;
+    Y_all_cell{i} = Y;
+    V_all_cell{i} = V;
+    delta_xp_all{i} = -(Y(:, 1) - Y(:, 3));
+
+    if plot_enabled
+        figure(figure_displacements); 
+        plot(T, Y(:,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T, Y(:,3), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+        legend('Cladding', 'Pellet1');
+
+        figure(figure_displacements_clean); 
+        plot(T, Y(:,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T, Y(:,3), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+        legend('Cladding', 'Pellet1');
+
+        figure(figure_velocities); 
+        plot(T, V(:,1), 'Color', color_set{i,1}, 'LineWidth', 1.5);
+        plot(T, V(:,2), 'Color', color_set{i,2}, 'LineWidth', 1.5);
+        legend('Cladding', 'Pellet1');
+
+        figure(figure_delta_xp); 
+        plot(T, -delta_xp_all{i}, 'Color', color_set{i,2}, 'LineWidth', 1.5);
+        legend('\Delta x_{p1}');
+    end
+end
+
+T_all = vertcat(T_all_cell{:});
+Y_all = vertcat(Y_all_cell{:});
+V_all = vertcat(V_all_cell{:});
+save('results/simulation_data_Hertz.mat', 'T_all', 'Y_all', 'V_all');
+
+%% Finalize the simulation information file
+elapsed_time = toc;
+finalize_simulation(fileID, elapsed_time);
+
+%% Save the final plots
+
+results_2DOF = 'results'; % Define the folder name
+if ~exist(results_2DOF, 'dir')
+    mkdir(results_2DOF); % Create folder if it does not exist
+end
+
+saveas(figure_displacements, fullfile(results_2DOF, 'displacements.png'));
+saveas(figure_displacements_clean, fullfile(results_2DOF, 'displacements_clean.png'));
+saveas(figure_velocities, fullfile(results_2DOF, 'velocities.png'));
+saveas(figure_delta_xp, fullfile(results_2DOF, 'delta_xp.png'));
+
+%% Save variables to a .mat file
+mat_filename = fullfile(results_2DOF, 'simulation_data.mat');
+
+save(mat_filename, 'T_all', 'Y_all', 'V_all', 'T_impact', 'impact_details', 'T_impact', 'color_set', 'T_all_cell', 'Y_all_cell');
+
+%% ================== FUNCTION: Hertz ODE ==================
+function dY = hertz_ode(T,Y)
+    % Global parameters from workspace
+    Mc = evalin('base','Mc'); Mp1 = evalin('base','Mp1');
+    K = evalin('base','K'); C = evalin('base','C');
+    F0 = evalin('base','F0'); OMEGA = evalin('base','OMEGA');
+    Mu_kc = evalin('base','Mu_kc'); Mu_kp = evalin('base','Mu_kp');
+    H1 = evalin('base','H1');
+    k_line = evalin('base','k_line'); c_line = evalin('base','c_line');
+    Fk = evalin('base','Fk'); g = evalin('base','g');
+
+    % State unpacking
+    Xc = Y(1); Vc = Y(2);
+    Xp = Y(3); Vp = Y(4);
+
+    % Relative kinematics
+    dx = Xp - Xc;
+    delta = max(abs(dx)-H1,0);  
+    sgn = sign(dx);  
+    ddelta = sgn*(Vp - Vc);  
+
+    % Hertzian normal force with damping
+    if delta > 0
+        Fn = k_line*delta;
+        if ddelta>0
+            Fn = Fn + c_line*ddelta;
+        end
+        F_c =  Fn*sgn;
+        F_p = -Fn*sgn;
+    else
+        F_c = 0; F_p = 0;
+    end
+
+    % External & frictional forces
+    F_ext_c = F0*sin(OMEGA*T);
+    C_eff = C;
+    F_fric_c = Mu_kc*((Mc+Mp1)*g)*sign(Vc);
+    F_fric_cp = Mu_kp*(Mp1*g+Fk)*sign(Vc-Vp);
+
+    % Equations of motion
+    a_c = (F_ext_c - C_eff*Vc - K*Xc - (F_fric_c + F_fric_cp))/Mc + F_c/Mc;
+    a_p = (0 + F_fric_cp)/Mp1 + F_p/Mp1;
+
+    dY = [Vc; a_c; Vp; a_p];
+end
